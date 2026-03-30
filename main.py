@@ -10,6 +10,9 @@ from services.llm_service import LLMService
 from services.cypher_generator import CypherGenerator
 from api import kg_api, chat_api
 
+# backend/main.py (更新部分)
+from config import config
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO if not config.DEBUG else logging.DEBUG,
@@ -63,10 +66,12 @@ async def startup_event():
 
     # 初始化大模型服务
     try:
+        # 在 startup_event 中初始化 LLM 服务时启用缓存
         llm_service = LLMService(
             api_base=config.LLM_API_BASE,
             api_key=config.LLM_API_KEY,
-            model=config.LLM_MODEL
+            model=config.LLM_MODEL,
+            cache_enabled=config.CACHE_ENABLED  # 启用缓存
         )
         logger.info(f"大模型服务初始化成功, 模型: {config.LLM_MODEL}")
     except Exception as e:

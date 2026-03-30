@@ -12,8 +12,12 @@ class Config:
 
     # LLM 配置 (Ollama)
     LLM_API_BASE = os.getenv("LLM_API_BASE", "http://localhost:11434/v1")
-    LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-r1:7b")
+    LLM_MODEL = os.getenv("LLM_MODEL", "qwen2:1.5b")  # 用小模型
     LLM_API_KEY = os.getenv("LLM_API_KEY", "local-test-key")
+
+    # 缓存配置
+    CACHE_ENABLED = os.getenv("CACHE_ENABLED", "True").lower() == "true"
+    CACHE_TTL = int(os.getenv("CACHE_TTL", 3600))  # 缓存1小时
 
     # 应用配置
     DEBUG = os.getenv("DEBUG", "True").lower() == "true"
@@ -28,5 +32,4 @@ class Config:
     DEFAULT_GRAPH_LIMIT = 50
 
 
-# 环境配置
 config = Config()
