@@ -3,6 +3,7 @@ from openai import OpenAI
 import json
 import logging
 import hashlib
+import re
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from collections import OrderedDict
@@ -48,13 +49,13 @@ class SimpleCache:
 
 
 class LLMService:
-    """大模型服务 - 带缓存"""
+    """大模型服务 - 带缓存和流式支持"""
 
     def __init__(self, api_base: str, api_key: str, model: str, cache_enabled=True):
         self.client = OpenAI(
             base_url=api_base,
             api_key=api_key,
-            timeout=120.0  # 增加超时到120秒
+            timeout=120.0
         )
         self.model = model
         self.cache_enabled = cache_enabled
@@ -64,6 +65,49 @@ class LLMService:
         """计算数据hash，用于缓存判断"""
         data_str = json.dumps(data[:50], sort_keys=True, ensure_ascii=False)
         return hashlib.md5(data_str.encode()).hexdigest()
+
+    def _clean_cypher(self, cypher: str) -> str:
+        """清理 Cypher 语句"""
+        if not cypher:
+            return cypher
+
+        # 移除 markdown 代码块标记
+        cypher = re.sub(r'^```cypher\n?', '', cypher)
+        cypher = re.sub(r'^```\n?', '', cypher)
+        cypher = re.sub(r'\n?```$', '', cypher)
+
+        # 只取第一个分号之前的内容
+        if ';' in cypher:
+            cypher = cypher.split(';')[0]
+
+        # 按行处理，移除多余的中文说明
+        lines = cypher.split('\n')
+        cleaned_lines = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 跳过包含中文提示的行
+            if any(keyword in line for keyword in ['请告诉我', '帮助', '需要', '如有', '如果', '有任何', '问题']):
+                continue
+
+            # 如果行包含中文但不是 Cypher 关键字，跳过
+            if re.search(r'[\u4e00-\u9fff]', line):
+                if not any(kw in line.upper() for kw in
+                           ['MATCH', 'RETURN', 'WHERE', 'WITH', 'CREATE', 'MERGE', 'OPTIONAL']):
+                    continue
+
+            cleaned_lines.append(line)
+
+        cypher = ' '.join(cleaned_lines).strip()
+
+        # 确保有 RETURN 子句
+        if cypher and 'RETURN' not in cypher.upper():
+            cypher += ' RETURN 1'
+
+        return cypher
 
     def generate_answer(self, question: str, query_result: Dict[str, Any]) -> str:
         """根据查询结果生成自然语言回答（带缓存）"""
@@ -94,29 +138,26 @@ class LLMService:
         return answer
 
     def _do_generate_answer(self, question: str, data: List[Dict], count: int) -> str:
-        """实际生成回答（流式）"""
+        """实际生成回答"""
         prompt = self._build_answer_prompt(question, data, count)
 
         try:
-            # 使用流式响应
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是一个专业的供应链助手，根据知识图谱查询结果回答问题。请简洁、准确。"},
+                    {"role": "system", "content": "你是一个专业的供应链助手，根据知识图谱查询结果回答问题。请简洁、准确，只输出答案，不要添加额外说明。"},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
-                max_tokens=800,
-                stream=True  # 启用流式
+                max_tokens=800
             )
 
-            # 收集流式响应
-            full_answer = ""
-            for chunk in response:
-                if chunk.choices[0].delta.content:
-                    full_answer += chunk.choices[0].delta.content
+            answer = response.choices[0].message.content.strip()
 
-            return full_answer if full_answer else self._format_raw_data(data, count)
+            # 清理多余内容
+            answer = self._clean_answer(answer)
+
+            return answer if answer else self._format_raw_data(data, count)
 
         except Exception as e:
             logger.error(f"生成回答失败: {e}")
@@ -149,7 +190,7 @@ class LLMService:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是一个专业的供应链助手，根据知识图谱查询结果回答问题。请简洁、准确。"},
+                    {"role": "system", "content": "你是一个专业的供应链助手，根据知识图谱查询结果回答问题。请简洁、准确，只输出答案，不要添加额外说明。"},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
@@ -164,7 +205,8 @@ class LLMService:
                     full_answer += content
                     yield content
 
-            # 保存缓存
+            # 清理并保存缓存
+            full_answer = self._clean_answer(full_answer)
             if self.cache_enabled and self.cache and full_answer:
                 data_hash = self._get_data_hash(data)
                 self.cache.set(question, data_hash, full_answer)
@@ -172,6 +214,33 @@ class LLMService:
         except Exception as e:
             logger.error(f"流式生成失败: {e}")
             yield self._format_raw_data(data, count)
+
+    def _clean_answer(self, answer: str) -> str:
+        """清理回答中的多余内容"""
+        if not answer:
+            return answer
+
+        # 移除常见的多余开头
+        prefixes_to_remove = [
+            "好的", "没问题", "根据查询结果", "以下是", "为您查询到",
+            "根据知识图谱", "根据数据", "查询结果显示"
+        ]
+
+        for prefix in prefixes_to_remove:
+            if answer.startswith(prefix):
+                answer = answer[len(prefix):].lstrip('，').lstrip('：').lstrip()
+
+        # 移除多余的结尾
+        suffixes_to_remove = [
+            "如果您还有其他问题", "如有其他问题", "需要帮助请随时",
+            "希望以上信息", "以上是查询结果"
+        ]
+
+        for suffix in suffixes_to_remove:
+            if suffix in answer:
+                answer = answer.split(suffix)[0]
+
+        return answer.strip()
 
     def _build_answer_prompt(self, question: str, data: List[Dict], count: int) -> str:
         """构建回答Prompt"""
@@ -188,6 +257,7 @@ class LLMService:
 1. 如果结果有多个，用列表形式展示
 2. 突出关键信息（物料名称、供应商名称等）
 3. 回答要简洁，不要超过200字
+4. 只输出答案，不要添加"好的"、"以下是"等开场白
 
 回答:
 """
