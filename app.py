@@ -8,5 +8,6 @@ if __name__ == "__main__":
         "main:app",
         host=config.HOST,
         port=config.PORT,
-        reload=config.DEBUG
+        reload=config.DEBUG,
+        log_level="info"
     )

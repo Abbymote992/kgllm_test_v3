@@ -1,97 +1,245 @@
-# backend/api/chat_api.py
-from fastapi import APIRouter, HTTPException, Depends
-from fastapi.responses import StreamingResponse
+"""
+聊天问答接口
+
+提供：
+1. 同步问答接口
+2. 流式问答接口
+3. 异步问答接口
+4. 多智能体流式接口
+"""
+
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, AsyncGenerator
 import asyncio
 import json
-import logging
+import time
+from datetime import datetime
 
-from models.request import QuestionRequest
-from models.response import AnswerResponse
-from services.kg_service import KnowledgeGraphService
-from services.llm_service import LLMService
-from services.cypher_generator import CypherGenerator
-from services.task_manager import task_manager
+import sys
+import os
 
-logger = logging.getLogger(__name__)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-router = APIRouter(prefix="/api", tags=["chat"])
+from config import AGENT_CONFIG
 
+router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-def get_kg_service():
-    from main import kg_service
-    return kg_service
-
-
-def get_llm_service():
-    from main import llm_service
-    return llm_service
+# 全局智能体实例（在main.py中初始化）
+_conductor_agent = None
+_data_knowledge_agent = None
+_analysis_agent = None
+_risk_agent = None
+_decision_agent = None
 
 
-def get_cypher_generator():
-    from main import cypher_generator
-    return cypher_generator
+def init_agents(conductor, data_knowledge, analysis, risk, decision):
+    """初始化智能体实例"""
+    global _conductor_agent, _data_knowledge_agent, _analysis_agent, _risk_agent, _decision_agent
+    _conductor_agent = conductor
+    _data_knowledge_agent = data_knowledge
+    _analysis_agent = analysis
+    _risk_agent = risk
+    _decision_agent = decision
 
 
-# ==========================================
-# 方案三：流式响应接口
-# ==========================================
+class ChatRequest(BaseModel):
+    """聊天请求"""
+    question: str = Field(..., description="用户问题")
+    session_id: str = Field(default="default", description="会话ID")
+    mode: str = Field(default="sync", description="模式: sync/stream/async")
+    history: Optional[list] = Field(default=[], description="对话历史")
 
-@router.post("/ask/stream")
-async def ask_stream(
-        request: QuestionRequest,
-        kg: KnowledgeGraphService = Depends(get_kg_service),
-        llm: LLMService = Depends(get_llm_service),
-        cypher_gen: CypherGenerator = Depends(get_cypher_generator)
-):
-    """流式问答 - 边生成边返回"""
 
-    async def generate():
-        question = request.question
-        logger.info(f"流式问答开始: {question}")
+class ChatResponse(BaseModel):
+    """聊天响应"""
+    answer: str = Field(..., description="回答")
+    session_id: str = Field(..., description="会话ID")
+    intent: Optional[str] = Field(default=None, description="识别的意图")
+    execution_time_ms: float = Field(default=0, description="执行时间(毫秒)")
+    details: Optional[Dict[str, Any]] = Field(default=None, description="详细信息")
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
+
+@router.post("/sync")
+async def sync_chat(request: ChatRequest):
+    """同步问答接口"""
+    if not _conductor_agent:
+        raise HTTPException(status_code=500, detail="智能体未初始化")
+
+    start_time = time.time()
+
+    try:
+        from agents.context import AgentContext
+        context = AgentContext(
+            session_id=request.session_id,
+            question=request.question
+        )
+
+        result = await _conductor_agent.execute(context)
+
+        execution_time_ms = (time.time() - start_time) * 1000
+
+        response = ChatResponse(
+            answer=result.get("answer", "无法生成回答"),
+            session_id=request.session_id,
+            intent=result.get("intent"),
+            execution_time_ms=round(execution_time_ms, 2),
+            details=result.get("intermediate_results") if AGENT_CONFIG.get("enable_debug", False) else None
+        )
+
+        return response
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
+
+
+@router.post("/stream")
+async def stream_chat(request: ChatRequest):
+    """流式问答接口"""
+    if not _conductor_agent:
+        raise HTTPException(status_code=500, detail="智能体未初始化")
+
+    async def generate() -> AsyncGenerator[str, None]:
         try:
-            # 1. 发送开始信号
-            yield f"data: {json.dumps({'type': 'start', 'message': '开始处理...'}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0.1)
+            from agents.context import AgentContext
+            context = AgentContext(
+                session_id=request.session_id,
+                question=request.question
+            )
 
-            # 2. 获取Schema并生成Cypher
-            yield f"data: {json.dumps({'type': 'step', 'step': 'generating_cypher', 'message': '正在理解问题...'}, ensure_ascii=False)}\n\n"
+            result = await _conductor_agent.execute(context)
+            answer = result.get("answer", "无法生成回答")
 
-            schema = kg.get_schema()
-            cypher = cypher_gen.generate(question, schema)
+            for char in answer:
+                yield char
+                await asyncio.sleep(0.01)
 
-            if not cypher:
-                yield f"data: {json.dumps({'type': 'error', 'message': '无法理解问题，请换个说法'}, ensure_ascii=False)}\n\n"
-                return
-
-            # 3. 返回生成的Cypher
-            yield f"data: {json.dumps({'type': 'cypher', 'cypher': cypher}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0.1)
-
-            # 4. 执行查询
-            yield f"data: {json.dumps({'type': 'step', 'step': 'querying', 'message': '正在查询知识图谱...'}, ensure_ascii=False)}\n\n"
-
-            result = kg.execute_query(cypher)
-
-            if not result["success"]:
-                yield f"data: {json.dumps({'type': 'error', 'message': f'查询失败:'})}"
-                return
-
-            # 5. 流式生成回答
-            yield f"data: {json.dumps({'type': 'step', 'step': 'generating_answer', 'message': '正在生成回答...'}, ensure_ascii=False)}\n\n"
-
-            # 收集完整回答
-            full_answer = ""
-            for chunk in llm.generate_answer_stream(question, result):
-                full_answer += chunk
-                yield f"data: {json.dumps({'type': 'chunk', 'content': chunk}, ensure_ascii=False)}\n\n"
-
-            # 6. 发送完成信号
-            yield f"data: {json.dumps({'type': 'end', 'full_answer': full_answer, 'cypher': cypher}, ensure_ascii=False)}\n\n"
+            yield "\n\n---\n"
+            yield f"意图: {result.get('intent', 'unknown')}"
 
         except Exception as e:
-            logger.error(f"流式问答失败: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            yield f"错误: {str(e)}"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@router.post("/async")
+async def async_chat(request: ChatRequest, background_tasks: BackgroundTasks):
+    """异步问答接口"""
+    import uuid
+
+    task_id = str(uuid.uuid4())
+
+    if not hasattr(async_chat, "tasks"):
+        async_chat.tasks = {}
+
+    async_chat.tasks[task_id] = {
+        "status": "processing",
+        "result": None,
+        "created_at": datetime.now().isoformat()
+    }
+
+    async def process_task():
+        try:
+            from agents.context import AgentContext
+            context = AgentContext(
+                session_id=request.session_id,
+                question=request.question
+            )
+
+            result = await _conductor_agent.execute(context)
+            async_chat.tasks[task_id]["status"] = "completed"
+            async_chat.tasks[task_id]["result"] = result
+
+        except Exception as e:
+            async_chat.tasks[task_id]["status"] = "failed"
+            async_chat.tasks[task_id]["error"] = str(e)
+
+    background_tasks.add_task(process_task)
+
+    return {
+        "task_id": task_id,
+        "status": "processing",
+        "message": "任务已提交，请使用 /api/chat/status/{task_id} 查询结果"
+    }
+
+
+@router.get("/status/{task_id}")
+async def get_task_status(task_id: str):
+    """查询异步任务状态"""
+    if not hasattr(async_chat, "tasks"):
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    task = async_chat.tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "result": task.get("result"),
+        "error": task.get("error"),
+        "created_at": task.get("created_at")
+    }
+
+
+@router.get("/health")
+async def health_check():
+    """健康检查"""
+    agents_ready = {
+        "conductor": _conductor_agent is not None,
+        "data_knowledge": _data_knowledge_agent is not None,
+        "analysis": _analysis_agent is not None,
+        "risk": _risk_agent is not None,
+        "decision": _decision_agent is not None
+    }
+
+    return {
+        "status": "healthy" if all(agents_ready.values()) else "degraded",
+        "agents": agents_ready,
+        "config": AGENT_CONFIG
+    }
+
+
+@router.post("/agent-stream-testbanben")
+async def agent_stream_chat_test_banben(request: ChatRequest):
+    """多智能体流式问答 - 模拟版本（不依赖 execute_stream）"""
+
+    async def generate():
+        if not _conductor_agent:
+            yield f"data: {json.dumps({'type': 'error', 'message': '智能体未初始化'})}\n\n"
+            return
+
+        # 模拟智能体执行过程
+        agents = [
+            ("conductor", "指挥协调器"),
+            ("data_knowledge", "数据知识智能体"),
+            ("analysis", "分析智能体"),
+            ("risk", "风险智能体"),
+            ("decision", "决策智能体")
+        ]
+
+        for agent, name in agents:
+            # 发送开始事件
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': agent, 'message': f'{name} 开始执行...'})}\n\n"
+            await asyncio.sleep(0.5)
+
+            # 发送完成事件
+            yield f"data: {json.dumps({'type': 'agent_complete', 'agent': agent, 'result': f'{name} 执行完成'})}\n\n"
+            await asyncio.sleep(0.3)
+
+        # 发送最终答案
+        yield f"data: {json.dumps({'type': 'complete', 'answer': f'关于「{request.question}」的模拟回答。多智能体协作完成！', 'details': {}})}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -104,163 +252,97 @@ async def ask_stream(
     )
 
 
-# ==========================================
-# 方案五：异步任务接口
-# ==========================================
+@router.post("/agent-stream")
+async def agent_stream_chat(request: ChatRequest):
+    """多智能体流式问答 - 真正调用各个智能体"""
 
-@router.post("/ask/async")
-async def ask_async(
-        request: QuestionRequest,
-        kg: KnowledgeGraphService = Depends(get_kg_service),
-        llm: LLMService = Depends(get_llm_service),
-        cypher_gen: CypherGenerator = Depends(get_cypher_generator)
-):
-    """异步问答 - 立即返回任务ID"""
+    async def generate():
+        if not _conductor_agent:
+            yield f"data: {json.dumps({'type': 'error', 'message': '智能体未初始化'})}\n\n"
+            return
 
-    # 创建任务
-    task_id = task_manager.create_task(request.question)
+        try:
+            from agents.context import AgentContext
+            context = AgentContext(
+                session_id=request.session_id,
+                question=request.question
+            )
 
-    # 后台执行
-    asyncio.create_task(
-        _process_question_async(
-            task_id,
-            request.question,
-            kg, llm, cypher_gen
-        )
-    )
+            # 1. 指挥协调器 - 意图识别
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'conductor', 'message': '正在识别用户意图...'})}\n\n"
+            await asyncio.sleep(0.3)
 
-    return {
-        "success": True,
-        "task_id": task_id,
-        "status": "pending",
-        "message": "任务已创建，请轮询获取结果"
-    }
+            # 调用指挥协调器的意图识别
+            intent_result = await _conductor_agent._recognize_intent(context)
+            intent = intent_result.get("intent", "simple_qa")
+            yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'conductor', 'result': f'识别到意图: {intent}'})}\n\n"
 
+            # 2. 数据知识智能体 - 查询知识图谱
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'data_knowledge', 'message': '正在查询知识图谱...'})}\n\n"
 
-@router.get("/ask/result/{task_id}")
-async def get_ask_result(task_id: str):
-    """获取异步任务结果"""
-    task = task_manager.get_task(task_id)
+            data_result = {}
+            if _data_knowledge_agent:
+                data_result = await _data_knowledge_agent.execute(context)
+                data_preview = str(data_result.get('data', ''))[:200] if data_result.get('data') else '未找到相关数据'
+                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'data_knowledge', 'result': data_preview})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'data_knowledge', 'result': '数据知识智能体未注册'})}\n\n"
 
-    if not task:
-        return {
-            "success": False,
-            "status": "not_found",
-            "message": "任务不存在"
+            # 3. 分析智能体 - 分析数据
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'analysis', 'message': '正在分析数据...'})}\n\n"
+
+            analysis_result = {}
+            if _analysis_agent:
+                analysis_result = await _analysis_agent.execute(context)
+                analysis_preview = str(analysis_result.get('analysis', ''))[:200] if analysis_result.get(
+                    'analysis') else '分析完成'
+                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'analysis', 'result': analysis_preview})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'analysis', 'result': '分析智能体未注册'})}\n\n"
+
+            # 4. 风险智能体 - 评估风险
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'risk', 'message': '正在评估风险...'})}\n\n"
+
+            risk_result = {}
+            if _risk_agent:
+                risk_result = await _risk_agent.execute(context)
+                risk_preview = str(risk_result.get('risks', ''))[:200] if risk_result.get('risks') else '未发现明显风险'
+                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'risk', 'result': risk_preview})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'risk', 'result': '风险智能体未注册'})}\n\n"
+
+            # 5. 决策智能体 - 生成建议
+            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'decision', 'message': '正在生成决策建议...'})}\n\n"
+
+            decision_result = {}
+            if _decision_agent:
+                decision_result = await _decision_agent.execute(context)
+                decision_preview = str(decision_result.get('decision', ''))[:200] if decision_result.get(
+                    'decision') else '建议已生成'
+                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'decision', 'result': decision_preview})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'decision', 'result': '决策智能体未注册'})}\n\n"
+
+            # 6. 整合最终答案
+            final_answer = _conductor_agent._generate_final_answer(context, {
+                "analysis": analysis_result,
+                "risk_assessment": risk_result,
+                "decision": decision_result
+            })
+
+            yield f"data: {json.dumps({'type': 'complete', 'answer': final_answer, 'details': {}})}\n\n"
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
         }
-
-    response = {
-        "success": True,
-        "task_id": task_id,
-        "status": task["status"].value,
-        "created_at": task["created_at"].isoformat()
-    }
-
-    if task["status"].value == "completed":
-        response["answer"] = task["result"]
-        response["cypher"] = task.get("cypher")
-    elif task["status"].value == "failed":
-        response["error"] = task.get("error")
-    elif task["status"].value == "timeout":
-        response["error"] = task.get("error", "任务执行超时")
-
-    return response
-
-
-@router.get("/ask/progress/{task_id}")
-async def get_ask_progress(task_id: str):
-    """获取任务进度"""
-    task = task_manager.get_task(task_id)
-
-    if not task:
-        return {"success": False, "status": "not_found"}
-
-    return {
-        "success": True,
-        "task_id": task_id,
-        "status": task["status"].value,
-        "steps": task.get("steps", []),
-        "current_step": task["steps"][-1]["name"] if task.get("steps") else None
-    }
-
-
-async def _process_question_async(task_id: str, question: str, kg, llm, cypher_gen):
-    """后台处理问题"""
-    try:
-        # 更新状态
-        task_manager.update_task(task_id, status=task_manager.status.PROCESSING)
-        task_manager.add_step(task_id, "开始处理", question)
-
-        # 生成Cypher
-        task_manager.add_step(task_id, "生成查询语句")
-        schema = kg.get_schema()
-        cypher = cypher_gen.generate(question, schema)
-
-        if not cypher:
-            task_manager.fail_task(task_id, "无法理解问题，请换个说法")
-            return
-
-        task_manager.add_step(task_id, "查询知识图谱", cypher)
-
-        # 执行查询
-        result = kg.execute_query(cypher)
-
-        if not result["success"]:
-            task_manager.fail_task(task_id, f"查询失败: {result.get('error', '未知错误')}")
-            return
-
-        # 生成回答
-        task_manager.add_step(task_id, "生成回答", f"找到{result['count']}条结果")
-        answer = llm.generate_answer(question, result)
-
-        # 完成任务
-        task_manager.complete_task(task_id, answer, cypher)
-
-    except Exception as e:
-        logger.error(f"异步处理失败: {e}")
-        task_manager.fail_task(task_id, str(e))
-
-
-# ==========================================
-# 保留原有同步接口（带缓存）
-# ==========================================
-
-@router.post("/ask", response_model=AnswerResponse)
-async def ask_question(
-        request: QuestionRequest,
-        kg: KnowledgeGraphService = Depends(get_kg_service),
-        llm: LLMService = Depends(get_llm_service),
-        cypher_gen: CypherGenerator = Depends(get_cypher_generator)
-):
-    """同步问答（带缓存）"""
-    logger.info(f"收到问题: {request.question}")
-
-    schema = kg.get_schema()
-    cypher = cypher_gen.generate(request.question, schema)
-
-    if not cypher:
-        return AnswerResponse(
-            success=False,
-            answer="无法理解您的问题，请尝试换个说法。",
-            message="Text2Cypher生成失败"
-        )
-
-    result = kg.execute_query(cypher)
-
-    if not result["success"]:
-        return AnswerResponse(
-            success=False,
-            answer=f"查询执行失败: {result.get('error', '未知错误')}",
-            cypher=cypher,
-            message="查询执行失败"
-        )
-
-    # 使用带缓存的生成
-    answer = llm.generate_answer(request.question, result)
-
-    return AnswerResponse(
-        success=True,
-        answer=answer,
-        cypher=cypher,
-        raw_data=result["data"][:10]
     )
