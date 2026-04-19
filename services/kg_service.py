@@ -9,11 +9,13 @@ logger = logging.getLogger(__name__)
 
 
 class KnowledgeGraphService:
-    def __init__(self, uri: str, user: str, password: str):
+    def __init__(self, uri: str, user: str, password: str, database: str = "neo4j"):
         self.uri = uri
         self.user = user
         self.password = password
+        self.database = database  # 添加 database 属性
         self.driver = None
+        self.logger = logger  # 添加 logger 属性
         self._connect()
 
     def _connect(self):
@@ -108,7 +110,7 @@ class KnowledgeGraphService:
         return cypher
 
     def execute_query(self, cypher: str, parameters: Dict = None) -> Dict[str, Any]:
-        """执行Cypher查询"""
+        """执行Cypher查询（同步）"""
         try:
             # 清理 Cypher
             cypher = self._clean_cypher(cypher)
@@ -152,7 +154,6 @@ class KnowledgeGraphService:
 
     def get_graph_data(self, limit: int = 50, node_types: List[str] = None) -> Dict:
         """获取图谱可视化数据 - 包含节点和关系"""
-
         try:
             with self.driver.session() as session:
                 # 使用路径查询获取节点和关系
@@ -267,24 +268,32 @@ class KnowledgeGraphService:
         """获取图谱Schema"""
         return {
             "nodes": [
-                {"labels": ["Project"], "properties": ["id", "name", "delivery_date", "priority", "status"]},
+                {"labels": ["Project"], "properties": ["project_id", "name", "series", "status"]},
+                {"labels": ["Module"], "properties": ["module_id", "name", "position", "importance"]},
+                {"labels": ["WorkOrder"],
+                 "properties": ["wo_id", "planned_start", "planned_end", "status", "priority"]},
                 {"labels": ["Material"],
-                 "properties": ["id", "name", "category", "criticality", "lead_time_days", "unit", "spec"]},
+                 "properties": ["material_code", "name", "specification", "grade", "lead_time", "is_key_material"]},
                 {"labels": ["Supplier"],
-                 "properties": ["id", "name", "rating", "lead_time_avg", "location", "category"]},
-                {"labels": ["Inventory"],
-                 "properties": ["id", "material_id", "project_id", "required_qty", "current_stock", "required_date"]},
+                 "properties": ["supplier_id", "name", "rating", "aerospace_qualified", "on_time_delivery_rate",
+                                "risk_level"]},
                 {"labels": ["PurchaseOrder"],
-                 "properties": ["id", "quantity", "order_date", "expected_date", "status", "tracking_info"]}
+                 "properties": ["po_id", "order_date", "quantity", "promised_date", "status", "unit_price"]},
+                {"labels": ["Inventory"],
+                 "properties": ["inventory_id", "available_quantity", "reserved_quantity", "warehouse_location"]},
+                {"labels": ["RiskEvent"],
+                 "properties": ["event_id", "name", "type", "severity", "status", "description"]}
             ],
             "relationships": [
-                {"type": "REQUIRES", "from": "Project", "to": "Material",
-                 "properties": ["required_qty", "required_date", "current_stock"]},
-                {"type": "HAS_INVENTORY", "from": "Material", "to": "Inventory", "properties": ["current_stock"]},
-                {"type": "TRIGGERED_BY", "from": "Inventory", "to": "PurchaseOrder",
-                 "properties": ["quantity", "order_date"]},
-                {"type": "PLACED_WITH", "from": "PurchaseOrder", "to": "Supplier", "properties": ["expected_date"]},
-                {"type": "SUPPLIED_BY", "from": "Material", "to": "Supplier", "properties": ["lead_time_days"]}
+                {"type": "BELONGS_TO", "from": "Module", "to": "Project"},
+                {"type": "HAS_WO", "from": "Project", "to": "WorkOrder"},
+                {"type": "REQUIRES", "from": "WorkOrder", "to": "Material",
+                 "properties": ["quantity", "required_date"]},
+                {"type": "SUPPLIES", "from": "Supplier", "to": "Material", "properties": ["price", "lead_time"]},
+                {"type": "HAS_PO", "from": "PurchaseOrder", "to": "Material", "properties": ["quantity", "unit_price"]},
+                {"type": "RECORDS", "from": "Inventory", "to": "Material", "properties": ["quantity", "batch"]},
+                {"type": "FULFILLS", "from": "PurchaseOrder", "to": "WorkOrder", "properties": ["allocated_quantity"]},
+                {"type": "AFFECTS", "from": "RiskEvent", "to": "WorkOrder", "properties": ["impact_level"]}
             ]
         }
 
@@ -318,3 +327,32 @@ class KnowledgeGraphService:
             return True
         except:
             return False
+
+    # ============================================
+    # 异步查询方法（供 data_knowledge_agent 调用）
+    # ============================================
+    async def query(self, cypher: str, params: Dict = None) -> Dict[str, Any]:
+        """异步执行Cypher查询"""
+        import asyncio
+
+        def sync_query():
+            # 确保使用正确的 database
+            with self.driver.session(database=self.database) as session:
+                result = session.run(cypher, params or {})
+                records = []
+                for record in result:
+                    record_dict = {}
+                    for key in record.keys():
+                        value = record[key]
+                        if hasattr(value, 'items'):
+                            record_dict[key] = dict(value.items())
+                        else:
+                            record_dict[key] = value
+                    records.append(record_dict)
+                return {"success": True, "data": records, "count": len(records)}
+
+        try:
+            return await asyncio.get_event_loop().run_in_executor(None, sync_query)
+        except Exception as e:
+            self.logger.error(f"异步查询失败: {e}")
+            return {"success": False, "error": str(e), "data": []}

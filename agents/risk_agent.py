@@ -69,98 +69,59 @@ class RiskAgent(BaseAgent):
         }
 
     @retry_on_failure(max_retries=2, delay=1.0)
+    # agents/risk_agent.py
+
     async def execute(self, context: AgentContext) -> Dict[str, Any]:
-        """
-        执行风险评估任务
+        """执行风险评估"""
 
-        Args:
-            context: 智能体上下文
+        # 从上下文获取数据
+        data_context = context.data_context
+        analysis_result = context.analysis_result
 
-        Returns:
-            风险评估结果
-        """
-        import time
-        start_time = time.time()
-
-        self.logger.info(f"开始风险评估: {context.question[:50]}...")
-
-        try:
-            # 获取分析结果和数据上下文
-            analysis_result = context.analysis_result
-            data_context = context.data_context
-
-            if not analysis_result:
-                self.logger.warning("分析结果为空，使用空数据")
-                analysis_result = {}
-
-            if not data_context:
-                data_context = {}
-
+        shortages = []
+        if analysis_result:
             shortages = analysis_result.get("shortages", [])
-            standardized_view = data_context.get("standardized_view", {})
 
-            # 1. 评估缺料风险
-            shortage_risk, shortage_events = await self._assess_shortage_risk(
-                shortages, standardized_view
-            )
+        # 评估风险
+        risks = []
+        risk_level = "低"
 
-            # 2. 评估供应商风险
-            supplier_risk, supplier_events = await self._assess_supplier_risk(
-                shortages, standardized_view
-            )
+        if shortages:
+            high_risk_materials = [s for s in shortages if s.get("shortage", 0) > 100]
+            if high_risk_materials:
+                risk_level = "高"
+                risks.append({
+                    "type": "缺料风险",
+                    "level": "高",
+                    "description": f"{len(high_risk_materials)}种物料严重缺货",
+                    "materials": high_risk_materials[:3]
+                })
+            elif len(shortages) > 0:
+                risk_level = "中"
+                risks.append({
+                    "type": "缺料风险",
+                    "level": "中",
+                    "description": f"{len(shortages)}种物料库存不足",
+                    "materials": shortages[:3]
+                })
 
-            # 3. 评估进度风险
-            schedule_risk, schedule_events = await self._assess_schedule_risk(
-                shortages, standardized_view
-            )
+        # 检查供应商风险
+        suppliers = data_context.get("suppliers", []) if data_context else []
+        for supplier in suppliers:
+            if supplier.get("risk_level") == "高":
+                risks.append({
+                    "type": "供应商风险",
+                    "level": "高",
+                    "description": f"供应商{supplier.get('supplier_name')}存在高风险",
+                    "supplier": supplier.get("supplier_name")
+                })
 
-            # 4. 计算综合风险等级
-            overall_risk = self._calculate_overall_risk(
-                shortage_risk, supplier_risk, schedule_risk
-            )
-
-            # 5. 生成预警信息
-            alerts = self._generate_alerts(
-                overall_risk,
-                shortage_events + supplier_events + schedule_events,
-                standardized_view
-            )
-
-            # 6. 生成风险摘要
-            summary = await self._generate_risk_summary(
-                overall_risk,
-                shortage_risk,
-                supplier_risk,
-                schedule_risk,
-                alerts
-            )
-
-            self._log_execution(start_time)
-
-            return {
-                "overall_risk_level": overall_risk.value,
-                "shortage_risk": shortage_risk.value,
-                "supplier_risk": supplier_risk,
-                "schedule_risk": schedule_risk.value,
-                "risk_events": [e.dict() for e in (shortage_events + supplier_events + schedule_events)],
-                "alerts": alerts,
-                "summary": summary
-            }
-
-        except Exception as e:
-            self.logger.error(f"风险评估失败: {e}")
-            self._log_execution(start_time, success=False)
-
-            return {
-                "overall_risk_level": RiskLevel.NONE.value,
-                "shortage_risk": RiskLevel.NONE.value,
-                "supplier_risk": {},
-                "schedule_risk": RiskLevel.NONE.value,
-                "risk_events": [],
-                "alerts": [],
-                "summary": f"风险评估失败: {str(e)}",
-                "error": str(e)
-            }
+        return {
+            "risks": risks,
+            "overall_risk_level": risk_level,
+            "risk_count": len(risks),
+            "risk_summary": f"整体风险等级：{risk_level}，共发现{len(risks)}个风险点"
+        }
 
     async def _assess_shortage_risk(
             self,

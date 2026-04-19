@@ -18,6 +18,8 @@ import logging
 import sys
 import os
 
+from agents import data_knowledge_agent
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.base_agent import BaseAgent, retry_on_failure
@@ -174,6 +176,26 @@ class ConductorAgent(BaseAgent):
         Returns:
             执行结果字典
         """
+        print("!!! CONDUCTOR EXECUTE START !!!", flush=True)
+        # ========== 强制短路：物料问题直接调用 DataKnowledgeAgent ==========
+        material_keywords = ["物料", "BOM", "齐套", "缺货", "采购清单", "物料需求", "东四平台", "所需物料"]
+        if any(kw in context.question for kw in material_keywords):
+            print("[Conductor] 检测到物料问题，强制短路调用 DataKnowledgeAgent")
+            dk_agent = self._agents.get(AgentType.DATA_KNOWLEDGE)
+            if dk_agent:
+                result = await dk_agent.execute(context)
+                # 从 result 中提取物料列表并生成回答
+                materials = result.get("standardized_view", {}).get("materials", [])
+                if materials:
+                    material_names = [m.get("material_name", m.get("material_code")) for m in materials]
+                    answer = f"项目所需物料：{', '.join(material_names)}"
+                else:
+                    answer = "未查询到物料数据，请检查项目名称是否正确。"
+                return {"answer": answer, "intent": "ANALYSIS", "execution_plan": None}
+            else:
+                print("[Conductor] 错误：DataKnowledgeAgent 未注册！")
+                return {"answer": "系统错误：数据知识智能体未注册", "intent": "ERROR"}
+
         import time
         start_time = time.time()
 
@@ -227,6 +249,14 @@ class ConductorAgent(BaseAgent):
         """
         识别用户意图
         """
+        material_keywords = ["物料", "BOM", "齐套", "缺货", "采购清单", "物料需求", "东四平台", "所需物料"]
+        # 注意：使用 context.question，而不是 context 对象
+        if any(kw in context.question for kw in material_keywords):
+            print("[Intent] 检测到物料关键词，强制标记为 ANALYSIS")
+            return {
+                "intent": IntentType.ANALYSIS,  # 或 IntentType.COMPLEX
+                "params": {}
+            }
         system_prompt = """你是供应链智能助手，负责识别用户问题的意图类型。
 
     意图类型说明：
@@ -434,6 +464,25 @@ class ConductorAgent(BaseAgent):
         """
         处理简单问答（不需要其他智能体）
         """
+        material_keywords = ["物料", "BOM", "齐套", "缺货", "采购清单", "物料需求", "东四平台", "所需物料"]
+        if any(kw in context.question for kw in material_keywords):
+            print("[SimpleQA] 检测到物料问题，强制调用 DataKnowledgeAgent")
+            # 从注册表中获取 DataKnowledgeAgent
+            dk_agent = self._agents.get(AgentType.DATA_KNOWLEDGE)
+            if dk_agent:
+                result = await dk_agent.execute(context)
+                # 从返回的字典中提取答案（根据你的实际返回结构）
+                # 假设 result 包含 standardized_view 和 graph_data
+                # 这里简单返回一个格式化后的字符串，你也可以调用 _generate_final_answer
+                materials = result.get("standardized_view", {}).get("materials", [])
+                if materials:
+                    material_names = [m.get("material_name", m.get("material_code")) for m in materials]
+                    return f"项目所需物料：{', '.join(material_names)}"
+                else:
+                    return "未查询到物料数据，请检查项目名称是否正确。"
+            else:
+                return "系统错误：数据知识智能体未注册。"
+
         system_prompt = """你是供应链知识助手，请根据你的知识回答问题。
     如果问题涉及具体数据（如齐套率、缺料情况），请说明需要查询系统数据。
     回答要简洁、准确。"""

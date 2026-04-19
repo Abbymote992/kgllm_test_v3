@@ -36,73 +36,91 @@ class AnalysisAgent(BaseAgent):
         self.critical_shortage_days = 7
 
     @retry_on_failure(max_retries=2, delay=1.0)
+    # agents/analysis_agent.py
+
     async def execute(self, context: AgentContext) -> Dict[str, Any]:
-        import time
-        start_time = time.time()
+        """执行数据分析"""
 
-        self.logger.info(f"开始分析: {context.question[:50]}...")
+        # 从上下文获取数据知识智能体的结果
+        data_context = context.data_context  # 这是标准化后的数据
+        graph_data = context.get_agent_result("data_knowledge")  # 获取完整结果
 
-        try:
-            data_context = context.data_context
+        # 获取物料和库存数据
+        materials = []
+        inventory = []
 
-            if not data_context:
-                self.logger.warning("数据上下文为空，使用空数据")
-                data_context = {}
+        if data_context:
+            materials = data_context.get("materials", [])
+            inventory = data_context.get("inventory", [])
 
-            standardized_view = data_context.get("standardized_view", {})
+        # 如果没有标准化数据，尝试从图谱数据中提取
+        if not materials and graph_data:
+            graph_nodes = graph_data.get("graph_data", {}).get("nodes", [])
+            for node in graph_nodes:
+                if isinstance(node, dict):
+                    # 检查是否是物料节点
+                    if "material_code" in node or "Material" in str(node.get("labels", [])):
+                        materials.append({
+                            "material_code": node.get("material_code", node.get("material_code")),
+                            "material_name": node.get("name", node.get("material_name")),
+                            "required_quantity": node.get("quantity", 0)
+                        })
 
-            # 1. 计算齐套率
-            kit_rate_result = await self._calculate_kit_rate(standardized_view)
-
-            # 2. 识别缺料项
-            shortages = await self._identify_shortages(standardized_view)
-
-            # 3. 分析瓶颈物料
-            bottleneck_materials = await self._analyze_bottlenecks(
-                shortages, standardized_view
-            )
-
-            # 4. 计算健康度评分
-            health_score = self._calculate_health_score(
-                kit_rate_result["kit_rate"],
-                shortages,
-                standardized_view
-            )
-
-            # 5. 生成分析摘要
-            summary = await self._generate_summary(
-                kit_rate_result,
-                shortages,
-                bottleneck_materials,
-                health_score
-            )
-
-            self._log_execution(start_time)
-
+        if not materials:
             return {
-                "kit_rate": kit_rate_result["kit_rate"],
-                "total_materials": kit_rate_result["total_materials"],
-                "kitted_count": kit_rate_result["kitted_count"],
-                "shortages": [s.dict() for s in shortages],
-                "bottleneck_materials": bottleneck_materials,
-                "health_score": health_score,
-                "summary": summary
-            }
-
-        except Exception as e:
-            self.logger.error(f"分析任务失败: {e}")
-            self._log_execution(start_time, success=False)
-
-            return {
-                "kit_rate": 0.0,
-                "total_materials": 0,
-                "kitted_count": 0,
+                "analysis": "未获取到物料数据，请检查知识图谱中的数据",
+                "kit_rate": 0,
                 "shortages": [],
-                "bottleneck_materials": [],
-                "health_score": 0,
-                "summary": f"分析失败: {str(e)}",
-                "error": str(e)
+                "total_materials": 0,
+                "fulfilled_materials": 0
             }
+
+        # 构建库存映射
+        inventory_map = {}
+        for inv in inventory:
+            code = inv.get("material_code")
+            if code:
+                inventory_map[code] = inv.get("available_quantity", 0)
+
+        # 分析齐套率
+        shortages = []
+        fulfilled_materials = 0
+
+        for material in materials:
+            material_code = material.get("material_code")
+            required_qty = material.get("required_quantity", material.get("quantity", 0))
+            available_qty = inventory_map.get(material_code, 0)
+
+            if available_qty >= required_qty:
+                fulfilled_materials += 1
+            else:
+                shortages.append({
+                    "material_code": material_code,
+                    "material_name": material.get("material_name", material.get("name")),
+                    "required": required_qty,
+                    "available": available_qty,
+                    "shortage": required_qty - available_qty if available_qty < required_qty else 0
+                })
+
+        total_materials = len(materials)
+        kit_rate = fulfilled_materials / total_materials if total_materials > 0 else 0
+
+        # 生成分析文本
+        if shortages:
+            analysis_text = f"共分析{total_materials}种物料，齐套率{kit_rate * 100:.1f}%。"
+            analysis_text += f"缺货物料{len(shortages)}种："
+            for s in shortages[:3]:
+                analysis_text += f"\n  - {s['material_name']}：需要{s['required']}，可用{s['available']}"
+        else:
+            analysis_text = f"共分析{total_materials}种物料，齐套率100%，所有物料库存充足。"
+
+        return {
+            "analysis": analysis_text,
+            "kit_rate": kit_rate,
+            "shortages": shortages,
+            "total_materials": total_materials,
+            "fulfilled_materials": fulfilled_materials
+        }
 
     async def _calculate_kit_rate(self, standardized_view: Dict) -> Dict[str, Any]:
         """计算齐套率"""

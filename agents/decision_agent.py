@@ -82,92 +82,38 @@ class DecisionAgent(BaseAgent):
 
     @retry_on_failure(max_retries=2, delay=1.0)
     async def execute(self, context: AgentContext) -> Dict[str, Any]:
-        """
-        执行决策任务
+        """生成决策建议"""
 
-        Args:
-            context: 智能体上下文
+        # 从上下文获取分析结果和风险评估
+        analysis_result = context.analysis_result or {}
+        risk_result = context.risk_result or {}
 
-        Returns:
-            决策结果
-        """
-        import time
-        start_time = time.time()
+        shortages = analysis_result.get("shortages", [])
+        kit_rate = analysis_result.get("kit_rate", 1.0)
+        risk_level = risk_result.get("overall_risk_level", "低")
 
-        self.logger.info(f"开始决策分析: {context.question[:50]}...")
+        recommended_action = ""
+        suggestions = []
 
-        try:
-            # 获取分析结果和风控结果
-            analysis_result = context.analysis_result
-            risk_result = context.risk_result
-            data_context = context.data_context
+        if shortages:
+            recommended_action = "建议紧急采购缺货物料"
+            for s in shortages[:3]:
+                suggestions.append(f"采购{s['material_name']} {s['shortage']}个")
 
-            if not analysis_result:
-                analysis_result = {}
-            if not risk_result:
-                risk_result = {}
-            if not data_context:
-                data_context = {}
+        if kit_rate < 0.8:
+            recommended_action = "齐套率偏低，建议优先处理缺货物料"
+        elif kit_rate >= 0.95:
+            recommended_action = "齐套率良好，按计划推进即可"
 
-            shortages = analysis_result.get("shortages", [])
-            kit_rate = analysis_result.get("kit_rate", 0)
-            overall_risk = risk_result.get("overall_risk_level", "none")
+        if risk_level == "高":
+            recommended_action += "，同时启动风险应对预案"
 
-            # 1. 判断紧急程度
-            urgency = self._determine_urgency(kit_rate, overall_risk, shortages)
-
-            # 2. 生成采购行动建议
-            procurement_actions = await self._generate_procurement_actions(
-                shortages, overall_risk, urgency, data_context
-            )
-
-            # 3. 生成替代方案
-            alternatives = await self._generate_alternatives(
-                shortages, data_context
-            )
-
-            # 4. 成本分析
-            cost_analysis = await self._analyze_costs(
-                procurement_actions, alternatives, shortages
-            )
-
-            # 5. 确定推荐行动
-            recommended_action = self._get_recommended_action(
-                procurement_actions, urgency
-            )
-
-            # 6. 生成决策摘要
-            summary = await self._generate_decision_summary(
-                urgency,
-                procurement_actions,
-                recommended_action,
-                cost_analysis
-            )
-
-            self._log_execution(start_time)
-
-            return {
-                "urgency": urgency,
-                "procurement_actions": [p.dict() for p in procurement_actions],
-                "alternative_suggestions": alternatives,
-                "recommended_action": recommended_action,
-                "cost_analysis": cost_analysis,
-                "summary": summary
-            }
-
-        except Exception as e:
-            self.logger.error(f"决策任务失败: {e}")
-            self._log_execution(start_time, success=False)
-
-            return {
-                "urgency": "unknown",
-                "procurement_actions": [],
-                "alternative_suggestions": [],
-                "recommended_action": f"决策失败: {str(e)}",
-                "cost_analysis": {},
-                "summary": f"决策分析失败: {str(e)}",
-                "error": str(e)
-            }
+        return {
+            "decision": f"根据分析，齐套率{kit_rate * 100:.1f}%，{recommended_action}",
+            "recommended_action": recommended_action,
+            "suggestions": suggestions,
+            "priority": "高" if shortages else "正常"
+        }
 
     def _determine_urgency(self, kit_rate: float, overall_risk: str, shortages: List) -> str:
         """
