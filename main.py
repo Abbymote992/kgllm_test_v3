@@ -24,6 +24,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 供依赖注入与其他模块引用的全局服务实例
+kg_service = None
+llm_service = None
+
 # 创建FastAPI应用
 app = FastAPI(
     title="供应链知识图谱多智能体系统",
@@ -51,8 +55,10 @@ app.include_router(kg_router)
 @app.on_event("startup")
 async def startup_event():
     """应用启动时的初始化"""
+    global kg_service, llm_service
     logger.info("正在初始化智能体系统...")
     logger.info(f"配置: DEBUG={config.DEBUG}, LLM模型={config.LLM_MODEL}")
+    logger.info(f"配置: USE_MOCK={config.DATA_SOURCE_CONFIG.get('use_mock', True)}")
 
     try:
         # 初始化Mock适配器
@@ -77,7 +83,7 @@ async def startup_event():
             uri=config.NEO4J_URI,
             user=config.NEO4J_USER,
             password=config.NEO4J_PASSWORD,
-            # database=config.NEO4J_DATABASE
+            database=config.NEO4J_DATABASE
         )
 
         rag_service = RAGService()
@@ -86,23 +92,27 @@ async def startup_event():
         from agents.data_knowledge_agent import DataKnowledgeAgent
         data_knowledge_agent = DataKnowledgeAgent(llm_service, kg_service)
 
-        # 注册Mock适配器
-        data_knowledge_agent.register_adapter(
-            PlatformType.PLATFORM1_BOM,
-            MockAdapterFactory.get_adapter(PlatformType.PLATFORM1_BOM)
-        )
-        data_knowledge_agent.register_adapter(
-            PlatformType.PLATFORM2_SCHEDULE,
-            MockAdapterFactory.get_adapter(PlatformType.PLATFORM2_SCHEDULE)
-        )
-        data_knowledge_agent.register_adapter(
-            PlatformType.SRM,
-            MockAdapterFactory.get_adapter(PlatformType.SRM)
-        )
-        data_knowledge_agent.register_adapter(
-            PlatformType.WMS,
-            MockAdapterFactory.get_adapter(PlatformType.WMS)
-        )
+        # 按配置决定是否注册Mock适配器
+        if config.DATA_SOURCE_CONFIG.get("use_mock", True):
+            data_knowledge_agent.register_adapter(
+                PlatformType.PLATFORM1_BOM,
+                MockAdapterFactory.get_adapter(PlatformType.PLATFORM1_BOM)
+            )
+            data_knowledge_agent.register_adapter(
+                PlatformType.PLATFORM2_SCHEDULE,
+                MockAdapterFactory.get_adapter(PlatformType.PLATFORM2_SCHEDULE)
+            )
+            data_knowledge_agent.register_adapter(
+                PlatformType.SRM,
+                MockAdapterFactory.get_adapter(PlatformType.SRM)
+            )
+            data_knowledge_agent.register_adapter(
+                PlatformType.WMS,
+                MockAdapterFactory.get_adapter(PlatformType.WMS)
+            )
+            logger.info("数据源模式: mock adapters enabled")
+        else:
+            logger.info("数据源模式: graph-only (mock adapters disabled)")
         data_knowledge_agent.set_rag_service(rag_service)
 
         # 创建其他智能体

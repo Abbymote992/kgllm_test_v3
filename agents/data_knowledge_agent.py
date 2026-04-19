@@ -98,6 +98,7 @@ class DataKnowledgeAgent(BaseAgent):
 
             # 数据标准化
             standardized_view = self._standardize_data(platform_data)
+            standardized_view = self._merge_graph_into_standardized_view(standardized_view, graph_data)
 
             # 获取业务规则
             business_rules = self._get_business_rules(context)
@@ -112,12 +113,9 @@ class DataKnowledgeAgent(BaseAgent):
             self.logger.info(f"graph_data nodes数量: {len(graph_data.get('nodes', []))}")
             self.logger.info(f"standardized_view materials数量: {len(standardized_view.get('materials', []))}")
             self.logger.info(f"standardized_view inventory数量: {len(standardized_view.get('inventory', []))}")
-            import json
-            with open("c:/temp/kg_debug.json", "w", encoding="utf-8") as f:
-                json.dump({
-                    "graph_data": graph_data,
-                    "standardized_view": standardized_view
-                }, f, ensure_ascii=False, indent=2)
+            if graph_data:
+                self.logger.info(f"graph query_type: {graph_data.get('query_type', 'unknown')}")
+                self.logger.info(f"graph cypher: {str(graph_data.get('cypher', ''))[:500]}")
             return {
                 "graph_data": graph_data,
                 "knowledge_context": knowledge_context,
@@ -129,12 +127,6 @@ class DataKnowledgeAgent(BaseAgent):
         except Exception as e:
             self.logger.error(f"数据知识任务失败: {e}")
             self._log_execution(start_time, success=False)
-
-            # data_knowledge_agent.py 的 execute 方法末尾，return 之前添加
-            self.logger.info(f"=== DataKnowledgeAgent 返回数据 ===")
-            self.logger.info(f"graph_data nodes数量: {len(graph_data.get('nodes', []))}")
-            self.logger.info(f"standardized_view materials数量: {len(standardized_view.get('materials', []))}")
-            self.logger.info(f"standardized_view inventory数量: {len(standardized_view.get('inventory', []))}")
             return {
                 "graph_data": {},
                 "knowledge_context": [],
@@ -223,6 +215,12 @@ class DataKnowledgeAgent(BaseAgent):
             return {"nodes": [], "relationships": [], "materials": [], "inventory": []}
 
         try:
+            # 对齐套/缺口类问题优先使用确定性查询，避免完全依赖LLM生成Cypher
+            if self._is_kitting_question(context.question):
+                deterministic = await self._query_kit_status_from_graph(context)
+                if deterministic.get("success"):
+                    return deterministic
+
             # 1. 获取 schema
             schema = await self._get_graph_schema()
 
@@ -263,46 +261,234 @@ class DataKnowledgeAgent(BaseAgent):
             traceback.print_exc()
             return {"nodes": [], "relationships": [], "materials": [], "inventory": []}
 
+    def _is_kitting_question(self, question: str) -> bool:
+        question = question or ""
+        keywords = ["齐套", "缺口", "缺料", "缺货", "物料齐套", "库存不足", "物料缺口"]
+        return any(k in question for k in keywords)
+
+    def _extract_query_hints(self, question: str) -> Dict[str, str]:
+        """从自然语言中抽取项目/模块关键词（轻量规则）"""
+        project_hint = ""
+        module_hint = ""
+
+        q = question or ""
+
+        # 常见命名：东四平台、东三平台等
+        m_project = re.search(r"([^\s，。？?]{1,20}平台)", q)
+        if m_project:
+            project_hint = m_project.group(1)
+
+        # 常见模块名：推进舱、载荷舱、返回舱
+        for token in ["推进舱", "载荷舱", "返回舱", "服务舱", "仪器舱"]:
+            if token in q:
+                module_hint = token
+                break
+
+        return {"project_hint": project_hint, "module_hint": module_hint}
+
+    async def _query_kit_status_from_graph(self, context: AgentContext) -> Dict[str, Any]:
+        """
+        针对齐套/缺口问题的固定Cypher查询（不依赖LLM）
+        """
+        hints = self._extract_query_hints(context.question)
+        hints["project_id"] = (context.extracted_params or {}).get("project_id", "")
+        hints["module_id"] = (context.extracted_params or {}).get("module_id", "")
+        cypher_strict = """
+        MATCH (p:Project)-[:HAS_WO]->(w:WorkOrder)-[r:REQUIRES]->(m:Material)
+        WHERE (
+                ($project_id = '' AND $project_hint = '')
+                OR coalesce(p.project_id, '') = $project_id
+                OR coalesce(p.name, '') CONTAINS $project_hint
+              )
+          AND (
+                ($module_id = '' AND $module_hint = '')
+                OR coalesce(w.module_id, '') = $module_id
+                OR coalesce(w.module_name, '') CONTAINS $module_hint
+                OR coalesce(w.name, '') CONTAINS $module_hint
+                OR coalesce(w.module_id, '') CONTAINS $module_hint
+              )
+        OPTIONAL MATCH (i:Inventory)-[:RECORDS]->(m)
+        OPTIONAL MATCH (s:Supplier)-[:SUPPLIES]->(m)
+        WITH m, r, sum(coalesce(i.available_quantity, 0)) AS available_quantity, collect(DISTINCT s.name) AS supplier_names
+        RETURN m.material_code AS material_code,
+               m.name AS material_name,
+               coalesce(r.quantity, 0) AS required_quantity,
+               available_quantity AS available_quantity,
+               CASE WHEN size(supplier_names) > 0 THEN supplier_names[0] ELSE '' END AS supplier_name
+        LIMIT 200
+        """
+
+        cypher_project_only = """
+        MATCH (p:Project)-[:HAS_WO]->(w:WorkOrder)-[r:REQUIRES]->(m:Material)
+        WHERE (
+                ($project_id = '' AND $project_hint = '')
+                OR coalesce(p.project_id, '') = $project_id
+                OR coalesce(p.name, '') CONTAINS $project_hint
+              )
+        OPTIONAL MATCH (i:Inventory)-[:RECORDS]->(m)
+        OPTIONAL MATCH (s:Supplier)-[:SUPPLIES]->(m)
+        WITH m, r, sum(coalesce(i.available_quantity, 0)) AS available_quantity, collect(DISTINCT s.name) AS supplier_names
+        RETURN m.material_code AS material_code,
+               m.name AS material_name,
+               coalesce(r.quantity, 0) AS required_quantity,
+               available_quantity AS available_quantity,
+               CASE WHEN size(supplier_names) > 0 THEN supplier_names[0] ELSE '' END AS supplier_name
+        LIMIT 200
+        """
+
+        cypher_global = """
+        MATCH (p:Project)-[:HAS_WO]->(w:WorkOrder)-[r:REQUIRES]->(m:Material)
+        OPTIONAL MATCH (i:Inventory)-[:RECORDS]->(m)
+        OPTIONAL MATCH (s:Supplier)-[:SUPPLIES]->(m)
+        WITH m, r, sum(coalesce(i.available_quantity, 0)) AS available_quantity, collect(DISTINCT s.name) AS supplier_names
+        RETURN m.material_code AS material_code,
+               m.name AS material_name,
+               coalesce(r.quantity, 0) AS required_quantity,
+               available_quantity AS available_quantity,
+               CASE WHEN size(supplier_names) > 0 THEN supplier_names[0] ELSE '' END AS supplier_name
+        LIMIT 200
+        """
+
+        attempts = [
+            ("deterministic_kit_strict", cypher_strict, hints),
+            ("deterministic_kit_project_only", cypher_project_only, hints),
+            ("deterministic_kit_global", cypher_global, {}),
+        ]
+
+        for query_type, cypher, params in attempts:
+            result = await self.kg_service.query(cypher, params)
+            if not result.get("success"):
+                continue
+            data = result.get("data", [])
+            self.logger.info(f"[GraphKit] {query_type} rows={len(data)}")
+            if not data:
+                continue
+
+            materials, inventory = self._extract_materials_and_inventory(data)
+            return {
+                "success": True,
+                "nodes": data,
+                "relationships": [],
+                "materials": materials,
+                "inventory": inventory,
+                "cypher": cypher,
+                "query_type": query_type
+            }
+
+        return {"success": False}
+
     def _extract_materials_and_inventory(self, data: List[Dict]) -> tuple:
         """从查询结果中提取物料和库存数据"""
-        materials = []
-        inventory = []
-        seen_materials = set()
+        material_map: Dict[str, Dict[str, Any]] = {}
+        inventory_map: Dict[str, Dict[str, Any]] = {}
 
         for record in data:
-            # 提取物料信息
+            if not isinstance(record, dict):
+                continue
+
             material_code = record.get("material_code") or record.get("m.material_code")
             material_name = record.get("material_name") or record.get("m.name") or record.get("name")
+            required_qty = record.get("required_quantity") or record.get("r.quantity") or 0
+            available_qty = record.get("available_quantity")
 
-            if material_code and material_code not in seen_materials:
-                seen_materials.add(material_code)
-                materials.append({
-                    "material_code": material_code,
-                    "material_name": material_name,
-                    "required_quantity": record.get("required_quantity") or record.get("r.quantity", 0),
-                    "grade": record.get("grade") or record.get("m.grade"),
-                    "is_key_material": record.get("is_key_material") or record.get("m.is_key_material", False)
-                })
+            # 兼容Neo4j节点对象转成dict后的嵌套结构，例如 m/i
+            if not material_code:
+                for v in record.values():
+                    if isinstance(v, dict) and v.get("material_code"):
+                        material_code = v.get("material_code")
+                        material_name = material_name or v.get("name")
+                        required_qty = required_qty or v.get("required_quantity", 0)
+                        break
 
-            # 提取库存信息
-            available_qty = record.get("available_quantity") or record.get("i.available_quantity")
+            if material_code:
+                if material_code not in material_map:
+                    material_map[material_code] = {
+                        "material_code": material_code,
+                        "material_name": material_name or material_code,
+                        "required_quantity": 0,
+                        "grade": record.get("grade") or record.get("m.grade"),
+                        "is_key_material": bool(record.get("is_key_material") or record.get("m.is_key_material", False))
+                    }
+                # 同一物料可能对应多个工单，required累加
+                material_map[material_code]["required_quantity"] += float(required_qty or 0)
+
             if material_code and available_qty is not None:
-                inventory.append({
-                    "material_code": material_code,
-                    "available_quantity": available_qty,
-                    "warehouse_location": record.get("warehouse_location") or record.get("i.warehouse_location")
-                })
+                if material_code not in inventory_map:
+                    inventory_map[material_code] = {
+                        "material_code": material_code,
+                        "available_quantity": 0.0,
+                        "warehouse_location": record.get("warehouse_location") or record.get("i.warehouse_location")
+                    }
+                inventory_map[material_code]["available_quantity"] += float(available_qty or 0)
 
-        # 去重库存（按物料代码合并）
-        inv_dict = {}
-        for inv in inventory:
-            code = inv["material_code"]
-            if code not in inv_dict:
-                inv_dict[code] = inv
+        return list(material_map.values()), list(inventory_map.values())
+
+    def _merge_graph_into_standardized_view(
+            self,
+            standardized: Dict[str, Any],
+            graph_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        将知识图谱查询结果并入标准化视图，供 analysis/risk/decision 统一消费
+        """
+        if not standardized:
+            standardized = {
+                "materials": [],
+                "inventory": [],
+                "purchases": [],
+                "suppliers": [],
+                "schedule": None
+            }
+
+        graph_materials = graph_data.get("materials", []) if isinstance(graph_data, dict) else []
+        graph_inventory = graph_data.get("inventory", []) if isinstance(graph_data, dict) else []
+
+        std_materials = standardized.get("materials", []) or []
+        std_inventory = standardized.get("inventory", []) or []
+
+        material_map = {m.get("material_code"): m for m in std_materials if m.get("material_code")}
+        for gm in graph_materials:
+            code = gm.get("material_code")
+            if not code:
+                continue
+            if code not in material_map:
+                material_map[code] = {
+                    "material_code": code,
+                    "material_name": gm.get("material_name", code),
+                    "required_quantity": gm.get("required_quantity", 0),
+                    "grade": gm.get("grade"),
+                    "is_key_material": gm.get("is_key_material", False),
+                    "source": "graph"
+                }
             else:
-                inv_dict[code]["available_quantity"] += inv["available_quantity"]
+                # 用图谱缺失补全/提高准确度
+                material_map[code]["material_name"] = material_map[code].get("material_name") or gm.get("material_name", code)
+                material_map[code]["required_quantity"] = max(
+                    float(material_map[code].get("required_quantity", 0) or 0),
+                    float(gm.get("required_quantity", 0) or 0)
+                )
 
-        return materials, list(inv_dict.values())
+        inventory_map = {i.get("material_code"): i for i in std_inventory if i.get("material_code")}
+        for gi in graph_inventory:
+            code = gi.get("material_code")
+            if not code:
+                continue
+            if code not in inventory_map:
+                inventory_map[code] = {
+                    "material_code": code,
+                    "available_quantity": gi.get("available_quantity", 0),
+                    "warehouse_location": gi.get("warehouse_location"),
+                    "source": "graph"
+                }
+            else:
+                inventory_map[code]["available_quantity"] = max(
+                    float(inventory_map[code].get("available_quantity", 0) or 0),
+                    float(gi.get("available_quantity", 0) or 0)
+                )
+
+        standardized["materials"] = list(material_map.values())
+        standardized["inventory"] = list(inventory_map.values())
+        return standardized
 
     async def _smart_graph_query(self, context: AgentContext) -> Dict[str, Any]:
         """智能图谱查询 - 使用LLM动态生成Cypher"""

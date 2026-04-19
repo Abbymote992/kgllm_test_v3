@@ -61,6 +61,35 @@ class LLMService:
         self.cache_enabled = cache_enabled
         self.cache = SimpleCache(max_size=100, ttl=3600) if cache_enabled else None
 
+    async def generate(
+            self,
+            prompt: str,
+            system_prompt: Optional[str] = None,
+            temperature: float = 0.7,
+            max_tokens: int = 1200
+    ) -> str:
+        """
+        给多智能体统一使用的异步生成接口（BaseAgent._call_llm 依赖此方法）
+        """
+        import asyncio
+
+        system_text = system_prompt or "你是一个专业的供应链分析助手。"
+
+        def _sync_call() -> str:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            content = response.choices[0].message.content if response.choices else ""
+            return (content or "").strip()
+
+        return await asyncio.get_event_loop().run_in_executor(None, _sync_call)
+
     def _get_data_hash(self, data: List[Dict]) -> str:
         """计算数据hash，用于缓存判断"""
         data_str = json.dumps(data[:50], sort_keys=True, ensure_ascii=False)

@@ -81,10 +81,19 @@ class RiskAgent(BaseAgent):
         shortages = []
         if analysis_result:
             shortages = analysis_result.get("shortages", [])
+        total_materials = analysis_result.get("total_materials", 0) if analysis_result else 0
 
         # 评估风险
         risks = []
         risk_level = "低"
+
+        if total_materials == 0 and not shortages:
+            return {
+                "risks": [],
+                "overall_risk_level": "none",
+                "risk_count": 0,
+                "risk_summary": "数据不足，暂无法完成风险评估"
+            }
 
         if shortages:
             high_risk_materials = [s for s in shortages if s.get("shortage", 0) > 100]

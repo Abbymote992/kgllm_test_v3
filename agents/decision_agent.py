@@ -90,10 +90,19 @@ class DecisionAgent(BaseAgent):
 
         shortages = analysis_result.get("shortages", [])
         kit_rate = analysis_result.get("kit_rate", 1.0)
+        total_materials = analysis_result.get("total_materials", 0)
         risk_level = risk_result.get("overall_risk_level", "低")
 
         recommended_action = ""
         suggestions = []
+
+        if total_materials == 0:
+            return {
+                "decision": "缺少有效物料/库存数据，暂无法生成可靠采购决策",
+                "recommended_action": "请先确认知识图谱中项目、工单、物料和库存关系是否完整",
+                "suggestions": [],
+                "priority": "待确认"
+            }
 
         if shortages:
             recommended_action = "建议紧急采购缺货物料"

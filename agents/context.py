@@ -54,6 +54,7 @@ class AgentContext:
 
         # 各智能体结果
         self.data_context: Optional[Dict[str, Any]] = None
+        self.data_knowledge_result: Optional[Dict[str, Any]] = None
         self.analysis_result: Optional[Dict[str, Any]] = None
         self.risk_result: Optional[Dict[str, Any]] = None
         self.decision_result: Optional[Dict[str, Any]] = None
@@ -88,7 +89,12 @@ class AgentContext:
     def set_agent_result(self, agent_name: str, result: Dict[str, Any]):
         """设置智能体结果"""
         if agent_name == "data_knowledge":
-            self.data_context = result
+            self.data_knowledge_result = result
+            # 下游分析/风控默认读取标准化后的数据视图
+            if isinstance(result, dict) and isinstance(result.get("standardized_view"), dict):
+                self.data_context = result.get("standardized_view")
+            else:
+                self.data_context = result
         elif agent_name == "analysis":
             self.analysis_result = result
         elif agent_name == "risk":
@@ -101,7 +107,7 @@ class AgentContext:
     def get_agent_result(self, agent_name: str) -> Optional[Dict[str, Any]]:
         """获取智能体结果"""
         if agent_name == "data_knowledge":
-            return self.data_context
+            return self.data_knowledge_result
         elif agent_name == "analysis":
             return self.analysis_result
         elif agent_name == "risk":

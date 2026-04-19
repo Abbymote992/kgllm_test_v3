@@ -254,11 +254,43 @@ async def agent_stream_chat_test_banben(request: ChatRequest):
 
 @router.post("/agent-stream")
 async def agent_stream_chat(request: ChatRequest):
-    """多智能体流式问答 - 真正调用各个智能体"""
+    """多智能体流式问答 - 按执行计划编排"""
 
     async def generate():
+        def sse(payload: Dict[str, Any]) -> str:
+            return f"data: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+
+        def build_agent_preview(agent_key: str, result: Dict[str, Any]) -> str:
+            if not isinstance(result, dict):
+                return str(result)[:200]
+
+            if agent_key == "data_knowledge":
+                sv = result.get("standardized_view", {}) or {}
+                return (
+                    f"物料{len(sv.get('materials', []))}种，"
+                    f"库存{len(sv.get('inventory', []))}条，"
+                    f"供应商{len(sv.get('suppliers', []))}家"
+                )
+            if agent_key == "analysis":
+                return (
+                    result.get("analysis")
+                    or f"齐套率: {result.get('kit_rate', 0) * 100:.1f}%"
+                )[:200]
+            if agent_key == "risk":
+                return (
+                    result.get("risk_summary")
+                    or f"风险等级: {result.get('overall_risk_level', 'unknown')}"
+                )[:200]
+            if agent_key == "decision":
+                return (
+                    result.get("recommended_action")
+                    or result.get("decision")
+                    or "已生成决策建议"
+                )[:200]
+            return str(result)[:200]
+
         if not _conductor_agent:
-            yield f"data: {json.dumps({'type': 'error', 'message': '智能体未初始化'})}\n\n"
+            yield sse({"type": "error", "message": "智能体未初始化"})
             return
 
         try:
@@ -268,74 +300,93 @@ async def agent_stream_chat(request: ChatRequest):
                 question=request.question
             )
 
-            # 1. 指挥协调器 - 意图识别
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'conductor', 'message': '正在识别用户意图...'})}\n\n"
-            await asyncio.sleep(0.3)
-
-            # 调用指挥协调器的意图识别
+            # 1) Conductor: 意图识别
+            yield sse({
+                "type": "agent_start",
+                "agent": "conductor",
+                "message": "正在识别用户意图..."
+            })
             intent_result = await _conductor_agent._recognize_intent(context)
-            intent = intent_result.get("intent", "simple_qa")
-            yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'conductor', 'result': f'识别到意图: {intent}'})}\n\n"
-
-            # 2. 数据知识智能体 - 查询知识图谱
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'data_knowledge', 'message': '正在查询知识图谱...'})}\n\n"
-
-            data_result = {}
-            if _data_knowledge_agent:
-                data_result = await _data_knowledge_agent.execute(context)
-                data_preview = str(data_result.get('data', ''))[:200] if data_result.get('data') else '未找到相关数据'
-                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'data_knowledge', 'result': data_preview})}\n\n"
-            else:
-                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'data_knowledge', 'result': '数据知识智能体未注册'})}\n\n"
-
-            # 3. 分析智能体 - 分析数据
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'analysis', 'message': '正在分析数据...'})}\n\n"
-
-            analysis_result = {}
-            if _analysis_agent:
-                analysis_result = await _analysis_agent.execute(context)
-                analysis_preview = str(analysis_result.get('analysis', ''))[:200] if analysis_result.get(
-                    'analysis') else '分析完成'
-                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'analysis', 'result': analysis_preview})}\n\n"
-            else:
-                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'analysis', 'result': '分析智能体未注册'})}\n\n"
-
-            # 4. 风险智能体 - 评估风险
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'risk', 'message': '正在评估风险...'})}\n\n"
-
-            risk_result = {}
-            if _risk_agent:
-                risk_result = await _risk_agent.execute(context)
-                risk_preview = str(risk_result.get('risks', ''))[:200] if risk_result.get('risks') else '未发现明显风险'
-                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'risk', 'result': risk_preview})}\n\n"
-            else:
-                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'risk', 'result': '风险智能体未注册'})}\n\n"
-
-            # 5. 决策智能体 - 生成建议
-            yield f"data: {json.dumps({'type': 'agent_start', 'agent': 'decision', 'message': '正在生成决策建议...'})}\n\n"
-
-            decision_result = {}
-            if _decision_agent:
-                decision_result = await _decision_agent.execute(context)
-                decision_preview = str(decision_result.get('decision', ''))[:200] if decision_result.get(
-                    'decision') else '建议已生成'
-                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'decision', 'result': decision_preview})}\n\n"
-            else:
-                yield f"data: {json.dumps({'type': 'agent_complete', 'agent': 'decision', 'result': '决策智能体未注册'})}\n\n"
-
-            # 6. 整合最终答案
-            final_answer = _conductor_agent._generate_final_answer(context, {
-                "analysis": analysis_result,
-                "risk_assessment": risk_result,
-                "decision": decision_result
+            intent = intent_result.get("intent")
+            context.set_intent(intent, intent_result.get("params", {}))
+            yield sse({
+                "type": "agent_complete",
+                "agent": "conductor",
+                "result": f"识别到意图: {context.intent.value}"
             })
 
-            yield f"data: {json.dumps({'type': 'complete', 'answer': final_answer, 'details': {}})}\n\n"
+            # simple_qa 直接回答
+            if context.intent.value == "simple_qa":
+                answer = await _conductor_agent._handle_simple_qa(context)
+                yield sse({
+                    "type": "complete",
+                    "answer": answer,
+                    "details": {"intent": context.intent.value}
+                })
+                return
+
+            # 2) 创建执行计划
+            plan = await _conductor_agent._create_execution_plan(context)
+            results = {}
+
+            # 3) 按计划执行子任务，并实时推送
+            for task_id in plan.execution_order:
+                subtask = next((st for st in plan.subtasks if st.task_id == task_id), None)
+                if not subtask:
+                    continue
+
+                agent_key = subtask.target_agent.value
+                agent = _conductor_agent._agents.get(subtask.target_agent)
+                if not agent:
+                    yield sse({
+                        "type": "agent_complete",
+                        "agent": agent_key,
+                        "result": f"智能体未注册: {agent_key}"
+                    })
+                    continue
+
+                yield sse({
+                    "type": "agent_start",
+                    "agent": agent_key,
+                    "message": f"{agent_key} 正在执行 {subtask.task_type}..."
+                })
+
+                try:
+                    result = await agent.execute(context)
+                    context.set_agent_result(agent_key, result)
+                    results[subtask.task_type] = result
+                    yield sse({
+                        "type": "agent_complete",
+                        "agent": agent_key,
+                        "result": build_agent_preview(agent_key, result)
+                    })
+                except Exception as task_err:
+                    subtask.error = str(task_err)
+                    yield sse({
+                        "type": "agent_complete",
+                        "agent": agent_key,
+                        "result": f"执行失败: {task_err}"
+                    })
+                    should_continue = await _conductor_agent._handle_subtask_failure(subtask, plan)
+                    if not should_continue:
+                        raise
+
+            # 4) 汇总最终回答
+            final_answer = _conductor_agent._generate_final_answer(context, results)
+            yield sse({
+                "type": "complete",
+                "answer": final_answer,
+                "details": {
+                    "intent": context.intent.value,
+                    "execution_plan": plan.dict(),
+                    "intermediate_results": results
+                }
+            })
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield sse({"type": "error", "message": str(e)})
 
     return StreamingResponse(
         generate(),

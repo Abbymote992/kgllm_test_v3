@@ -81,6 +81,8 @@ class BaseAgent(ABC):
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)
+        # 避免与root logger重复输出
+        self.logger.propagate = False
 
         # 统计信息
         self.stats = {

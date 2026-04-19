@@ -25,11 +25,22 @@ class KnowledgeGraphService:
                 self.uri,
                 auth=(self.user, self.password)
             )
-            # 测试连接
-            with self.driver.session() as session:
-                result = session.run("RETURN 1 as test")
-                test = result.single()["test"]
-                logger.info(f"Neo4j连接成功: {self.uri}")
+            # 优先测试指定database，不存在则回退默认database
+            try:
+                with self.driver.session(database=self.database) as session:
+                    result = session.run("RETURN 1 as test")
+                    _ = result.single()["test"]
+                logger.info(f"Neo4j连接成功: {self.uri}, database={self.database}")
+            except Exception as db_err:
+                if "DatabaseNotFound" in str(db_err) or "Database does not exist" in str(db_err):
+                    logger.warning(f"配置的数据库不存在: {self.database}，回退默认数据库")
+                    self.database = None
+                    with self.driver.session() as session:
+                        result = session.run("RETURN 1 as test")
+                        _ = result.single()["test"]
+                    logger.info(f"Neo4j连接成功: {self.uri}, database=default")
+                else:
+                    raise
         except Exception as e:
             logger.error(f"Neo4j连接失败: {e}")
             raise
@@ -336,8 +347,7 @@ class KnowledgeGraphService:
         import asyncio
 
         def sync_query():
-            # 确保使用正确的 database
-            with self.driver.session(database=self.database) as session:
+            def _run_with_session(session):
                 result = session.run(cypher, params or {})
                 records = []
                 for record in result:
@@ -350,6 +360,22 @@ class KnowledgeGraphService:
                             record_dict[key] = value
                     records.append(record_dict)
                 return {"success": True, "data": records, "count": len(records)}
+
+            # 优先使用指定database
+            try:
+                if self.database:
+                    with self.driver.session(database=self.database) as session:
+                        return _run_with_session(session)
+            except Exception as db_err:
+                if "DatabaseNotFound" in str(db_err) or "Database does not exist" in str(db_err):
+                    self.logger.warning(f"数据库 {self.database} 不存在，自动回退默认数据库")
+                    self.database = None
+                else:
+                    raise
+
+            # 回退默认database
+            with self.driver.session() as session:
+                return _run_with_session(session)
 
         try:
             return await asyncio.get_event_loop().run_in_executor(None, sync_query)

@@ -54,7 +54,9 @@ class ConductorAgent(BaseAgent):
                 "description": "齐套分析流程",
                 "subtasks": [
                     {"type": "data_collection", "agent": AgentType.DATA_KNOWLEDGE},
-                    {"type": "analysis", "agent": AgentType.ANALYSIS}
+                    {"type": "analysis", "agent": AgentType.ANALYSIS},
+                    {"type": "risk_assessment", "agent": AgentType.RISK},
+                    {"type": "decision", "agent": AgentType.DECISION}
                 ],
                 "execution_mode": "sequential"  # 串行执行
             },
@@ -176,26 +178,6 @@ class ConductorAgent(BaseAgent):
         Returns:
             执行结果字典
         """
-        print("!!! CONDUCTOR EXECUTE START !!!", flush=True)
-        # ========== 强制短路：物料问题直接调用 DataKnowledgeAgent ==========
-        material_keywords = ["物料", "BOM", "齐套", "缺货", "采购清单", "物料需求", "东四平台", "所需物料"]
-        if any(kw in context.question for kw in material_keywords):
-            print("[Conductor] 检测到物料问题，强制短路调用 DataKnowledgeAgent")
-            dk_agent = self._agents.get(AgentType.DATA_KNOWLEDGE)
-            if dk_agent:
-                result = await dk_agent.execute(context)
-                # 从 result 中提取物料列表并生成回答
-                materials = result.get("standardized_view", {}).get("materials", [])
-                if materials:
-                    material_names = [m.get("material_name", m.get("material_code")) for m in materials]
-                    answer = f"项目所需物料：{', '.join(material_names)}"
-                else:
-                    answer = "未查询到物料数据，请检查项目名称是否正确。"
-                return {"answer": answer, "intent": "ANALYSIS", "execution_plan": None}
-            else:
-                print("[Conductor] 错误：DataKnowledgeAgent 未注册！")
-                return {"answer": "系统错误：数据知识智能体未注册", "intent": "ERROR"}
-
         import time
         start_time = time.time()
 
@@ -228,7 +210,7 @@ class ConductorAgent(BaseAgent):
             results = await self._execute_plan(execution_plan, context)
 
             # 5. 生成最终答案
-            final_answer = await self._generate_final_answer(context, results)
+            final_answer = self._generate_final_answer(context, results)
 
             self._log_execution(start_time)
 
@@ -255,7 +237,7 @@ class ConductorAgent(BaseAgent):
             print("[Intent] 检测到物料关键词，强制标记为 ANALYSIS")
             return {
                 "intent": IntentType.ANALYSIS,  # 或 IntentType.COMPLEX
-                "params": {}
+                "params": self._extract_basic_params(context.question)
             }
         system_prompt = """你是供应链智能助手，负责识别用户问题的意图类型。
 
@@ -337,6 +319,35 @@ class ConductorAgent(BaseAgent):
                 return {"intent": IntentType.COMPLEX, "params": {}}
             else:
                 return {"intent": IntentType.SIMPLE_QA, "params": {}}
+
+    def _extract_basic_params(self, question: str) -> Dict[str, Any]:
+        """
+        轻量参数提取（用于mock/规则查询兜底）
+        """
+        q = question or ""
+        params: Dict[str, Any] = {}
+
+        project_map = {
+            "东四平台": "PROJ-EAST4-001",
+            "载人飞船": "PROJ-SHIP-002",
+        }
+        module_map = {
+            "推进舱": "MOD-PROP-001",
+            "载荷舱": "MOD-PAY-001",
+            "返回舱": "MOD-RET-001",
+        }
+
+        for k, v in project_map.items():
+            if k in q:
+                params["project_id"] = v
+                break
+
+        for k, v in module_map.items():
+            if k in q:
+                params["module_id"] = v
+                break
+
+        return params
 
     async def _create_execution_plan(self, context: AgentContext) -> ExecutionPlan:
         """
@@ -644,16 +655,19 @@ class ConductorAgent(BaseAgent):
         if analysis:
             kit_rate = analysis.get("kit_rate", 0)
             shortages = analysis.get("shortages", [])
+            total_materials = analysis.get("total_materials", 0)
 
             answer = f"根据查询结果：\n"
-            if kit_rate > 0:
+            if total_materials > 0:
                 answer += f"📊 齐套率: {kit_rate * 100:.1f}%\n"
+            else:
+                answer += "⚠️ 暂未获取到有效物料/库存数据，无法准确判断齐套状态\n"
 
             if shortages:
                 answer += f"⚠️ 缺货物料数量: {len(shortages)}种\n"
                 for s in shortages[:3]:
                     answer += f"  - {s.get('material_name', '未知物料')}\n"
-            else:
+            elif total_materials > 0:
                 answer += "✅ 无缺货物料，所有物料已齐套\n"
 
             if risk:

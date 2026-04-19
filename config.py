@@ -23,7 +23,7 @@ class Config:
     NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
     NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4jj")
-    NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+    NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "graph07.db")
 
     # ==================== LLM 配置 (Ollama) ====================
     LLM_API_BASE = os.getenv("LLM_API_BASE", "http://localhost:11434/v1")
@@ -47,7 +47,7 @@ class Config:
 
     # ==================== 数据源配置 ====================
     DATA_SOURCE_CONFIG = {
-        "use_mock": True,                  # 是否使用Mock数据（实验阶段）
+        "use_mock": os.getenv("USE_MOCK", "false").lower() == "false",  # 是否使用Mock数据
         "platform1_bom": {
             "enabled": True,
             "type": "mock",                # mock / rest_api / database
